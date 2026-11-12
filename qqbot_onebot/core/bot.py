@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import time
+import textwrap
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -143,6 +144,9 @@ def unwrap_quote_blob(text: str) -> str:
 
 # 平台把合并转发渲染成纯文本时的形状(见 _rendered_forward_nodes)
 _FWD_BLOCK_RE = re.compile(r"===\s*消息\s*\d+\s*===")
+_FWD_RELATED_BLOCK_RE = re.compile(
+    r"^[ \t]*---[ \t]*第\s*\d+\s*条[ \t]*---[ \t]*$", re.M)
+_FWD_ASSOCIATION_RE = re.compile(r"^[ \t]*\[关联消息\][ \t]*\r?$", re.M)
 _FWD_SENDER_RE = re.compile(r"\[发送者\]\s*(.+)")
 # 正文到下一个方括号标记为止(可能有多行)
 _FWD_BODY_RE = re.compile(r"\[消息内容\]\s*(.*?)(?=\n\s*\[|\Z)", re.S)
@@ -150,6 +154,8 @@ _FWD_BODY_RE = re.compile(r"\[消息内容\]\s*(.*?)(?=\n\s*\[|\Z)", re.S)
 _FWD_ATTACH_RE = re.compile(
     r"\[附件\d+\][ \t]*类型:(\S+)[ \t]+文件名:(.+?)(?:[ \t]+尺寸:(\S+))?"
     r"(?:[ \t]+大小:(\S+))?(?:[ \t]+URL:(\S+))?[ \t]*$", re.M)
+# 渲染文本没有平台嵌套 id, 用根消息 id 与节点路径生成稳定的本地 id
+FORWARD_NEST_MAX_DEPTH = 8
 
 _LINK_KEYS = ("jumpurl", "jump_url", "qqdocurl", "url", "link", "share_url",
               "detail_url", "web_url", "weburl")
@@ -1054,27 +1060,37 @@ class BotInstance:
             segments.append({"type": "image", "data": {"file": url, "url": url}})
         return segments
 
-    async def _rendered_forward_nodes(self, text: str) -> list[dict]:
-        """把平台渲染成纯文本的合并转发(message_type=102 的常见形态)还原成节点:
+    async def _rendered_forward_nodes(
+        self, text: str, forward_id: str, *, related: bool = False,
+        path: tuple[int, ...] = (), depth: int = 0,
+    ) -> list[dict]:
+        """还原文本形式的合并转发, 关联消息递归保存为独立的嵌套转发."""
+        if related:
+            first = _FWD_RELATED_BLOCK_RE.search(text)
+            if first is None:
+                return []
+            marker_text = first.group(0)
+            indent = marker_text[:len(marker_text) - len(marker_text.lstrip(" \t"))]
+            # 只分当前缩进层级的条目, 更深层的条目留给递归调用
+            marker = re.compile(
+                rf"^{re.escape(indent)}---[ \t]*第\s*\d+\s*条[ \t]*---[ \t]*$", re.M)
+            blocks = marker.split(text)[1:]
+        else:
+            blocks = _FWD_BLOCK_RE.split(text)[1:]  # 首段是 [群聊的聊天记录] 抬头
 
-            [群聊的聊天记录]
-            === 消息 1 ===
-            [发送者] 某人
-            [消息内容] 说了什么
-            [附件1] 类型:视频 文件名:x.mp4 尺寸:360x640 大小:137.6MB URL:https://…
-
-        不还原的话媒体只剩裸 URL 混在文本里, 下游插件会误当链接处理.
-        """
-        blocks = _FWD_BLOCK_RE.split(text)[1:]      # 首段是 [群聊的聊天记录] 抬头
         nodes: list[dict] = []
-        for block in blocks:
+        for index, block in enumerate(blocks, 1):
+            parts = _FWD_ASSOCIATION_RE.split(block, maxsplit=1)
+            own = parts[0]
+            related_text = parts[1] if len(parts) > 1 else ""
             segments: list[dict] = []
-            sender = _FWD_SENDER_RE.search(block)
-            body = _FWD_BODY_RE.search(block)
-            if body and body.group(1).strip():
-                segments.append({"type": "text",
-                                 "data": {"text": body.group(1).strip()}})
-            for match in _FWD_ATTACH_RE.finditer(block):
+            sender = _FWD_SENDER_RE.search(own)
+            body = _FWD_BODY_RE.search(own)
+            if body:
+                body_text = textwrap.dedent(body.group(1)).strip()
+                if body_text:
+                    segments.append({"type": "text", "data": {"text": body_text}})
+            for match in _FWD_ATTACH_RE.finditer(own):
                 kind, filename, _size, url = (match.group(1), match.group(2),
                                               match.group(4), match.group(5))
                 if not url:
@@ -1086,6 +1102,31 @@ class BotInstance:
                 segments.append({"type": seg_type, "data": {
                     "file": filename, "url": url, "file_id": url,
                 }})
+            segments = self._split_faces(segments)
+
+            if related_text:
+                nested: list[dict] = []
+                if depth < FORWARD_NEST_MAX_DEPTH:
+                    nested = await self._rendered_forward_nodes(
+                        related_text, forward_id, related=True,
+                        path=(*path, index), depth=depth + 1)
+                if nested:
+                    node_path = ".".join(str(part) for part in (*path, index))
+                    nested_id = f"{forward_id}:nested:{node_path}"
+                    await self.db.execute(
+                        "INSERT OR REPLACE INTO forwards (id, bot_appid, nodes, raw, ts)"
+                        " VALUES (?,?,?,?,?)",
+                        (nested_id, self.appid, json.dumps(nested, ensure_ascii=False),
+                         json.dumps({"content": related_text}, ensure_ascii=False)[:20000],
+                         int(time.time())),
+                    )
+                    segments.append({"type": "forward", "data": {"id": nested_id}})
+                else:
+                    # 深度超限或结构未识别时保留原文, 避免关联内容直接消失
+                    fallback = textwrap.dedent(related_text).strip()
+                    if fallback:
+                        segments.append({"type": "text", "data": {"text": fallback}})
+
             if not segments:
                 continue
             nodes.append({
@@ -1324,13 +1365,13 @@ class BotInstance:
             return segments
 
         if elements or msg_type in (101, 102):
+            fid = qq_msg_id or f"fwd-{int(time.time() * 1000)}"
             nodes = await self._elements_to_nodes(elements)
             if not nodes and msg_type in (101, 102):
                 # 常态是只给渲染文本, 没有结构化 elements
                 nodes = await self._rendered_forward_nodes(
-                    str(data.get("content") or ""))
+                    str(data.get("content") or ""), fid)
             if nodes:
-                fid = qq_msg_id or f"fwd-{int(time.time() * 1000)}"
                 await self.db.execute(
                     "INSERT OR REPLACE INTO forwards (id, bot_appid, nodes, raw, ts)"
                     " VALUES (?,?,?,?,?)",

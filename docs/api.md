@@ -163,7 +163,7 @@ QQ 的图文卡片: 标题 + 简介 + 一张封面, 点卡片打开链接。用�
 | `send_msg` / `send_group_msg` / `send_private_msg` | ✅ | 见下方消息段; 被动回复/主动消息自动选择 |
 | `send_group_forward_msg` / `send_private_forward_msg` / `send_forward_msg` | 降级 | 群聊转为一页网页, 群里发一张「聊天记录」卡片, 经腾讯文档跳转打开(插件「合并转发转网页」; 关掉跳转则默认发链接)。私聊、插件关闭、没有可用网页地址、或不含媒体的兑换码类内容时逐条发送 |
 | `delete_msg` | ✅ | 撤回; 一条消息被拆成多条时整批撤。bot 非群管时仅 2 分钟内 |
-| `get_msg` / `get_forward_msg` | ✅ | 读本地记录(默认保留 7 天) |
+| `get_msg` / `get_forward_msg` | ✅ | 读本地记录(默认保留 7 天); 文本形式的嵌套合并转发递归展开 |
 | `get_group_msg_history` / `get_friend_msg_history` | ✅ | 同上 |
 | `get_login_info` / `get_status` / `get_version_info` | ✅ | |
 | `get_stranger_info` | ✅ | 只有昵称, 其余字段为空 |
