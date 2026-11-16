@@ -34,7 +34,7 @@ from ..db import Database
 from ..idmap import IdMap
 from ..qq.api import QQApiClient, QQApiError
 from ..onebot import events as ob_events
-from ..onebot.faces import SYSFACE_NAMES
+from ..onebot.segments import ATTACHMENT_TAG_RE, inline_markup, split_faces
 from ..plugin import HookContext, registry as plugins
 from .access import AccessControl
 from .builtin import BuiltinCommands, match_builtin
@@ -44,6 +44,7 @@ from .passthrough import Passthrough
 from .quota import QuotaTracker
 from .sender import Sender
 from .unparsed import UnparsedLog, files as unparsed_files
+from .fieldwatch import FieldWatch
 from . import cards, cdnkeys
 from .uploader import MediaUploader
 
@@ -71,6 +72,10 @@ CREDENTIAL_DISABLE_AFTER = 3
 IDENTITY_REFRESH_INTERVAL = 3600
 # 未落库消息 id 的去重记忆(有界). 平台重推只在投递后几秒内; 落库的由 store.seen 兜.
 HANDLED_MSGS_MAX = 1024
+# group_members 只在昵称/名片/角色变化时立即写; 仅刷新 last_seen 的话同一成员最多这么久写一次
+# (每条群消息都 upsert 会改成员行和 last_seen 索引两个随机页). 记忆表超过上限整表清空重来
+MEMBER_SEEN_INTERVAL = 600
+MEMBER_WRITTEN_MAX = 50000
 # 收到但没下发的消息, 同一会话同一原因多久记一次日志
 DROP_LOG_INTERVAL = 600
 # 开机补查未知状态群: 延后避开开机流量, 单轮上限防千群 bot 打爆接口
@@ -101,17 +106,7 @@ _AT_TAG_RE = re.compile(
 )
 # openid 是定长十六进制串; 不像 openid 的 at 目标不建映射, 免得造出假用户
 _OPENID_RE = re.compile(r"^[0-9A-Fa-f]{16,64}$")
-# QQ 表情: <faceType=1,faceId="5",ext="<base64 的 {"text":"..."}>">
-# faceType=6 是图片占位(faceId=附件序号), 文件已在 attachments 里, 丢掉;
-# faceId 为空的(如 faceType=4 的 [猪])没有 OneBot 表情 id, 转成 ext 里的文字
-_FACE_TAG_RE = re.compile(
-    r"<faceType=(\d+),\s*faceId=\"(\d*)\"(?:,\s*ext=\"([^\"]*)\")?\s*>")
 _AT_ALL_TOKENS = {"everyone", "all", "全体成员"}
-# 富媒体在 content 里的内联占位, 文件已在 attachments 里, 标记纯噪音:
-# <attachmentType="image/gif",attachmentIndex=0,description="<base64 的 {"text":..}>">
-_ATTACHMENT_TAG_RE = re.compile(
-    r"<attachmentType=\"[^\"]*\"\s*,\s*attachmentIndex=\d+"
-    r"(?:\s*,\s*description=\"[^\"]*\")?\s*>")
 
 # 引用"本身就是引用"的消息时, 平台不给 msg_elements, 而是把链路渲染成纯文本
 # 塞进 content, idx 为一次性 TMP_<uuid>:
@@ -208,6 +203,14 @@ def _find_link(node, depth: int = 0) -> str:
     return ""
 
 
+def _avatar_link(author: dict) -> str:
+    """author.avatar(2026-11-13 起下发); 只收 http(s), http 升成 https."""
+    url = str(author.get("avatar") or "").strip()
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url if url.startswith("https://") else ""
+
+
 def _parse_ts(value: Any) -> int:
     if isinstance(value, (int, float)):
         return int(value)
@@ -263,6 +266,7 @@ class BotInstance:
         token_urls: list[str],
         api_bases: list[str],
         unparsed: UnparsedLog | None = None,
+        fieldwatch: FieldWatch | None = None,
     ):
         self.cfg = row
         self.appid: str = row["appid"]
@@ -276,6 +280,8 @@ class BotInstance:
         self.unparsed = unparsed or UnparsedLog(
             unparsed_files(Path(getattr(db, "path", "data/x")).parent)[0]
         )
+        # 新下发字段监视: manager 传全部 bot 共用的那份
+        self.fieldwatch = fieldwatch or FieldWatch(db, self.unparsed)
         self.api = QQApiClient(self.appid, self.secret, token_urls, api_bases, http)
         self.api.on_credential_error = self._on_credential_error
         self.api.on_fatal_code = self._on_fatal_code
@@ -298,6 +304,8 @@ class BotInstance:
         # 而 @ 消息的 GROUP_MESSAGE_CREATE 副本会被误判成"收到非 @ 消息".
         self._handled_msgs: deque[str] = deque(maxlen=HANDLED_MSGS_MAX)
         self._handled_set: set[str] = set()
+        # (群, 成员) -> 上次写进 group_members 的 (昵称, 名片, last_seen)
+        self._member_written: dict[tuple[str, str], tuple[str, str, int]] = {}
         self._drop_logged: dict[tuple[str, str], float] = {}
         self.me_info: dict = {}
         self.started = False
@@ -679,18 +687,21 @@ class BotInstance:
                         state.allow_proactive, state.recv_msg_setting, state.bot_role)
             return state
 
-    async def group_role(self, group_openid: str, force: bool = False) -> str:
-        """bot 在该群的角色, 缓存太旧(或 force)就刷一次(提权平台不推事件).
+    async def role_fresh_state(self, group_openid: str, force: bool = False,
+                               reason: str = "role-check") -> PeerState:
+        """要用 bot 角色时的群状态: 缓存太旧(或 force)就刷一次(提权/降权平台不推事件).
 
-        force 给"进入会话"这类用户动作, 仍受 30s/群 节流.
+        force 给"进入会话"、插件 no_cache 这类明确要新值的调用, 仍受 30s/群 节流与全局预算.
         """
         state = self._peer_states.get(("group", group_openid))
         stale = (force or state is None
                  or int(time.time()) - state.checked_at > ROLE_FRESH_SECONDS)
         if stale:
-            state = await self.group_state(group_openid, refresh=True,
-                                           reason="role-check")
-        return state.bot_role if state else ""
+            state = await self.group_state(group_openid, refresh=True, reason=reason)
+        return state
+
+    async def group_role(self, group_openid: str, force: bool = False) -> str:
+        return (await self.role_fresh_state(group_openid, force)).bot_role
 
     async def refresh_peer_state(self, chat_type: str, openid: str, reason: str) -> None:
         """发送失败(限频/权限)后的后台复查入口."""
@@ -832,6 +843,10 @@ class BotInstance:
         # 通知类事件的 event_id 可当被动回复凭据, 不吃主动消息配额
         if event_id:
             await self._record_event_credential(event_type, data, event_id)
+        try:
+            await self.fieldwatch.check(event_type, data, self.appid)
+        except Exception:
+            logger.exception("[%s] 字段监视出错(不影响处理)", self.appid)
         current = {"t": event_type, "d": data, "id": event_id, "sent": False}
         token = _RAW_EVENT.set(current)
         try:
@@ -896,7 +911,7 @@ class BotInstance:
 
         GROUP_MESSAGE_CREATE 的 content 原样保留 at 标记; @ 消息已被剥掉 @bot 前缀.
         """
-        text = _ATTACHMENT_TAG_RE.sub("", text)
+        text = ATTACHMENT_TAG_RE.sub("", text)
         segments: list[dict] = []
         at_me = False
         pos = 0
@@ -926,61 +941,8 @@ class BotInstance:
             segments.append({"type": "text", "data": {"text": tail}})
         return self._split_faces(segments), at_me
 
-    @staticmethod
-    def _split_faces(segments: list[dict]) -> list[dict]:
-        """把文本里的 <faceType=..,faceId=".."> 切成 OneBot face 段; raw 按 NapCat 形状填, ext 文字存为 summary."""
-        out: list[dict] = []
-        for seg in segments:
-            if seg.get("type") != "text":
-                out.append(seg)
-                continue
-            text = seg["data"].get("text", "")
-            pos = 0
-            for match in _FACE_TAG_RE.finditer(text):
-                if match.start() > pos:
-                    out.append({"type": "text",
-                                "data": {"text": text[pos:match.start()]}})
-                if match.group(1) == "6":
-                    pos = match.end()
-                    continue
-                data = {"id": match.group(2)}
-                raw_ext = match.group(3) or ""
-                if raw_ext:
-                    try:
-                        import base64 as _b64  # noqa: PLC0415
-                        payload = json.loads(
-                            _b64.b64decode(raw_ext + "==").decode("utf-8"))
-                        if payload.get("text"):
-                            data["summary"] = str(payload["text"])
-                    except Exception:
-                        pass
-                if data["id"]:
-                    # NapCat 的 raw 是原始 face 元素, 名字在 raw.faceText(带前导 /)
-                    raw = {"faceIndex": int(data["id"])}
-                    name = SYSFACE_NAMES.get(data["id"])
-                    if name:
-                        raw["faceText"] = f"/{name}"
-                    elif data.get("summary"):
-                        raw["faceText"] = data["summary"]
-                    data["raw"] = raw
-                    out.append({"type": "face", "data": data})
-                elif data.get("summary"):
-                    out.append({"type": "text", "data": {"text": data["summary"]}})
-                pos = match.end()
-            tail = text[pos:]
-            if tail or pos == 0:
-                out.append({"type": "text", "data": {"text": tail or text}})
-        merged: list[dict] = []
-        for s in out:
-            if s["type"] == "text":
-                if not s["data"].get("text"):
-                    continue
-                if merged and merged[-1]["type"] == "text":
-                    merged[-1] = {"type": "text", "data": {
-                        "text": merged[-1]["data"]["text"] + s["data"]["text"]}}
-                    continue
-            merged.append(s)
-        return merged
+    # 内联表情标记切段(合并转发的节点也要用, 故在 segments.py)
+    _split_faces = staticmethod(split_faces)
 
     def _note_rkey(self, url: str) -> None:
         """记下入站直链里的 rkey 给转发网页用(见 cdnkeys); 落盘限一分钟一次."""
@@ -1028,13 +990,6 @@ class BotInstance:
                 }})
         return segments
 
-    # 已知会消费的 payload 字段; 出现其它字段就落盘, 便于事后补解析
-    _KNOWN_MSG_FIELDS = {
-        "id", "author", "content", "timestamp", "attachments", "group_openid",
-        "group_id", "message_type", "message_scene", "msg_elements", "mentions",
-        "message_reference", "ark_data", "op_member_openid",
-    }
-
     @staticmethod
     def _msg_idx_of(data: dict) -> str:
         """message_scene.ext 里的 msg_idx=REFIDX_xxx; 引用只认它, 用消息 id 平台静默忽略."""
@@ -1062,7 +1017,8 @@ class BotInstance:
         if isinstance(text, dict):
             text = text.get("content") or text.get("text") or ""
         if text:
-            segments.append({"type": "text", "data": {"text": str(text)}})
+            # 与顶层消息同样带内联的表情/附件标记
+            segments.extend(inline_markup(str(text)))
         # 媒体在 attachments 数组里
         segments.extend(await self._attachments_to_segments(element))
         # 兼容可能的扁平形状
@@ -1105,7 +1061,7 @@ class BotInstance:
             if body:
                 body_text = textwrap.dedent(body.group(1)).strip()
                 if body_text:
-                    segments.append({"type": "text", "data": {"text": body_text}})
+                    segments.extend(inline_markup(body_text))
             for match in _FWD_ATTACH_RE.finditer(own):
                 kind, filename, _size, url = (match.group(1), match.group(2),
                                               match.group(4), match.group(5))
@@ -1421,12 +1377,6 @@ class BotInstance:
                     f"{sorted((ark.get('fields') or {}).keys())}",
                     ark, self.appid,
                 )
-
-        unknown = set(data) - self._KNOWN_MSG_FIELDS
-        if unknown:
-            self.unparsed.record("unknown_fields",
-                                 f"payload 出现未知字段: {sorted(unknown)}",
-                                 data, self.appid)
         return segments
 
     async def _group_gate(self, group_openid: str, text: str) -> bool:
@@ -1473,7 +1423,8 @@ class BotInstance:
             self._inflight_msgs.add(qq_msg_id)
         try:
             if qq_msg_id and (qq_msg_id in self._handled_set
-                              or await self.store.seen(self.appid, qq_msg_id)):
+                              or await self.store.seen(
+                                  self.appid, qq_msg_id, _parse_ts(data.get("timestamp")))):
                 return                  # 处理过的重推(未启用的群不落库, 只在内存里)
             recorded = await self._on_group_message_inner(data, at_me, qq_msg_id)
             # 落了库的由 store.seen 兜住, 内存只记没落库的
@@ -1500,6 +1451,9 @@ class BotInstance:
             # 能收到非 @ 消息本身就证明该群开了"接收全部消息"
             await self._note_recv_all(group_openid)
         nickname = author.get("username", "") or ""
+        # 2026-11-13 起下发(文档未写): 群名片 / 头像链接
+        card = str(author.get("member_nickname") or "")
+        avatar = _avatar_link(author)
         payload_role = author.get("member_role", "") or ""
         ts = _parse_ts(data.get("timestamp"))
 
@@ -1532,21 +1486,31 @@ class BotInstance:
         group_virtual = await self.idmap.to_virtual(self.appid, "group", group_openid)
         user_virtual = await self.idmap.to_virtual(
             self.appid, "user", user_openid, nickname=nickname,
-            union_openid=author.get("union_openid") or None,
+            union_openid=author.get("union_openid") or None, avatar=avatar,
         )
-        # role 仅在 payload 显式给出时覆盖缓存(GROUP_ADD_ROBOT 写入的 admin 不被冲掉)
-        await self.db.execute(
-            "INSERT INTO group_members (bot_appid, group_openid, user_openid,"
-            " nickname, role, last_seen) VALUES (?,?,?,?,?,?)"
-            " ON CONFLICT(bot_appid, group_openid, user_openid) DO UPDATE SET"
-            " nickname=CASE WHEN excluded.nickname!='' THEN excluded.nickname ELSE nickname END,"
-            " role=CASE WHEN ?!='' THEN ? ELSE role END,"
-            " last_seen=excluded.last_seen",
-            # 原始 payload_role 只用来判给没给, 写入的值统一归一化
-            (self.appid, group_openid, user_openid, nickname,
-             self._norm_role(payload_role), ts,
-             payload_role, self._norm_role(payload_role)),
-        )
+        member_key = (group_openid, user_openid)
+        prev = self._member_written.get(member_key)
+        if (prev is None or payload_role
+                or (nickname and nickname != prev[0]) or (card and card != prev[1])
+                or not 0 <= ts - prev[2] < MEMBER_SEEN_INTERVAL):
+            # role 仅在 payload 显式给出时覆盖缓存(GROUP_ADD_ROBOT 写入的 admin 不被冲掉)
+            await self.db.execute(
+                "INSERT INTO group_members (bot_appid, group_openid, user_openid,"
+                " nickname, role, last_seen, card) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(bot_appid, group_openid, user_openid) DO UPDATE SET"
+                " nickname=CASE WHEN excluded.nickname!='' THEN excluded.nickname ELSE nickname END,"
+                " role=CASE WHEN ?!='' THEN ? ELSE role END,"
+                " card=CASE WHEN excluded.card!='' THEN excluded.card ELSE card END,"
+                " last_seen=excluded.last_seen",
+                # 原始 payload_role 只用来判给没给, 写入的值统一归一化
+                (self.appid, group_openid, user_openid, nickname,
+                 self._norm_role(payload_role), ts, card,
+                 payload_role, self._norm_role(payload_role)),
+            )
+            if len(self._member_written) >= MEMBER_WRITTEN_MAX:
+                self._member_written.clear()
+            self._member_written[member_key] = (
+                nickname or (prev[0] if prev else ""), card or (prev[1] if prev else ""), ts)
         role = await self._member_role(group_openid, user_openid, payload_role)
 
         segments: list[dict] = []
@@ -1570,7 +1534,7 @@ class BotInstance:
         segments.extend(extra)
 
         at_me = at_me or at_in_text
-        sender = ob_events.make_sender(user_virtual, nickname, role)
+        sender = ob_events.make_sender(user_virtual, nickname, role, card=card)
         mid = await self.store.record_incoming(
             self.appid, "group", group_openid, group_virtual, user_virtual,
             qq_msg_id, segments, sender, ts, msg_idx=self._msg_idx_of(data),
@@ -1621,7 +1585,8 @@ class BotInstance:
                 return
             self._inflight_msgs.add(qq_msg_id)
         try:
-            if qq_msg_id and await self.store.seen(self.appid, qq_msg_id):
+            if qq_msg_id and await self.store.seen(
+                    self.appid, qq_msg_id, _parse_ts(data.get("timestamp"))):
                 return
             await self._on_c2c_message_inner(data, qq_msg_id)
         finally:
@@ -1634,6 +1599,7 @@ class BotInstance:
         user_virtual = await self.idmap.to_virtual(
             self.appid, "user", user_openid,
             union_openid=author.get("union_openid") or None,
+            avatar=_avatar_link(author),
         )
 
         text = (data.get("content") or "").strip()
@@ -1815,6 +1781,7 @@ class BotInstance:
             " AND user_openid=?",
             (self.appid, group_openid, member_openid),
         )
+        self._member_written.pop((group_openid, member_openid), None)
         state = self._peer_states.get(("group", group_openid))
         if not (state and state.compliant):
             return

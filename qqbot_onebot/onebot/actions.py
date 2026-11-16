@@ -19,6 +19,7 @@ import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .. import __version__
+from ..core import avatars
 from ..core.sender import POKE_TEXT, SendError
 from ..qq.api import QQApiError
 from .segments import emoji_of, segments_to_cq
@@ -451,9 +452,15 @@ async def get_group_list(bot: "BotInstance", params: dict) -> dict:
     return ok(groups)
 
 
-async def _self_member_role(bot: "BotInstance", group_openid: str) -> tuple[str, int]:
-    """bot 在该群的 (角色, 入群时间), 走 peer_state 缓存."""
-    state = await bot.group_state(group_openid, reason="member-info")
+def _no_cache(params: dict) -> bool:
+    return str(params.get("no_cache")).lower() in ("true", "1")
+
+
+async def _self_member_role(bot: "BotInstance", group_openid: str,
+                            force: bool = False) -> tuple[str, int]:
+    """bot 在该群的 (角色, 入群时间). 提权/降权平台不推事件, 缓存超过
+    ROLE_FRESH_SECONDS 或 force(插件传 no_cache)就刷一次 bot_state."""
+    state = await bot.role_fresh_state(group_openid, force, reason="member-info")
     join_time = 0
     if state.joined_at:
         try:
@@ -473,7 +480,8 @@ async def get_group_member_info(bot: "BotInstance", params: dict) -> dict:
     group_virtual = _int_of(params.get("group_id"))
 
     if virtual == bot.self_id:
-        role, join_time = await _self_member_role(bot, group_openid)
+        role, join_time = await _self_member_role(bot, group_openid,
+                                                  _no_cache(params))
         return ok(_member_dict(group_virtual, bot.self_id, bot.name, "",
                                role, join_time))
 
@@ -481,7 +489,7 @@ async def get_group_member_info(bot: "BotInstance", params: dict) -> dict:
     if user_openid is None:
         return failed(1404, f"unknown user_id {params.get('user_id')}")
     row = await bot.db.fetchone(
-        "SELECT nickname, role, last_seen FROM group_members"
+        "SELECT nickname, card, role, last_seen FROM group_members"
         " WHERE bot_appid=? AND group_openid=? AND user_openid=?",
         (bot.appid, group_openid, user_openid),
     )
@@ -489,8 +497,10 @@ async def get_group_member_info(bot: "BotInstance", params: dict) -> dict:
     nickname = (row["nickname"] if row else "") or (entry.nickname if entry else "")
     role = (row["role"] if row else "") or "member"
     last_seen = row["last_seen"] if row else 0
-    # TODO(qq-official): 无成员详情接口, 数据来自事件缓存(card 恒等于昵称)
-    return ok(_member_dict(group_virtual, virtual, nickname, nickname, role, 0,
+    # TODO(qq-official): 无成员详情接口, 数据来自消息缓存; 群名片取最近一条消息的
+    # member_nickname(2026-11-13 起下发), 之后没再发言的成员退回昵称
+    return ok(_member_dict(group_virtual, virtual, nickname,
+                           (row["card"] if row else "") or nickname, role, 0,
                            last_sent=last_seen))
 
 
@@ -514,7 +524,7 @@ async def get_group_member_list(bot: "BotInstance", params: dict) -> dict:
         return failed(1404, f"unknown group_id {params.get('group_id')}")
     group_virtual = _int_of(params.get("group_id"))
     rows = await bot.db.fetchall(
-        "SELECT user_openid, nickname, role, last_seen FROM group_members"
+        "SELECT user_openid, nickname, card, role, last_seen FROM group_members"
         " WHERE bot_appid=? AND group_openid=? ORDER BY last_seen DESC",
         (bot.appid, group_openid),
     )
@@ -522,11 +532,12 @@ async def get_group_member_list(bot: "BotInstance", params: dict) -> dict:
     for row in rows:
         virtual = await bot.idmap.to_virtual(bot.appid, "user", row["user_openid"])
         members.append(_member_dict(
-            group_virtual, virtual, row["nickname"], row["nickname"],
+            group_virtual, virtual, row["nickname"], row["card"] or row["nickname"],
             row["role"], 0, last_sent=row["last_seen"],
         ))
     # bot 用真实角色, 写死 member 会让统计群管的逻辑漏掉 bot
-    self_role, self_join = await _self_member_role(bot, group_openid)
+    self_role, self_join = await _self_member_role(bot, group_openid,
+                                                   _no_cache(params))
     members.append(_member_dict(group_virtual, bot.self_id, bot.name, "",
                                 self_role, self_join))
     # TODO(qq-official): 无全量成员接口, 仅返回发言缓存过的成员(90 天没出现的会被清掉)
@@ -941,6 +952,7 @@ async def get_additional_user_detail(bot: "BotInstance", params: dict) -> dict:
     virtual = _int_of(raw_user_id)
     size = _int_of(params.get("size", 640)) if params.get("size") is not None else 640
 
+    entry = None
     if virtual == bot.self_id:
         appid, openid, nickname, kind = bot.appid, bot.appid, bot.name, "bot"
     else:
@@ -951,10 +963,13 @@ async def get_additional_user_detail(bot: "BotInstance", params: dict) -> dict:
             return failed(1404, "user not found")
         appid, openid, nickname, kind = entry.bot_appid, entry.openid, entry.nickname, entry.kind
 
-    spec = "0" if size == 0 else ("100" if size <= 100 else "640")
-    avatar_url = f"https://q.qlogo.cn/qqapp/{appid}/{openid}/{spec}"
+    spec = avatars.size_spec(size)
+    avatar_url = avatars.fallback_url(appid, openid, spec)
     if kind == "bot" and appid == bot.appid:
         avatar_url = bot.me_info.get("avatar") or avatar_url  # /users/@me 的头像优先
+    elif kind == "user" and entry is not None and entry.avatar:
+        # 平台下发的头像链接优先, 验过失效(签名 key 过期回 400)才用自拼的
+        avatar_url = await avatars.resolve(entry, spec, bot.http, avatars.PROBE)
 
     union = None
     row = await bot.db.fetchone(

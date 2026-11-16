@@ -6,12 +6,16 @@ Single writer process. All timestamps are unix seconds (int).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Iterable
 
 import aiosqlite
+
+logger = logging.getLogger("qqbot.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS id_map (
@@ -23,6 +27,7 @@ CREATE TABLE IF NOT EXISTS id_map (
     nickname     TEXT NOT NULL DEFAULT '',
     first_seen   INTEGER NOT NULL,
     last_seen    INTEGER NOT NULL,
+    avatar       TEXT NOT NULL DEFAULT '',     -- 平台下发的头像链接(author.avatar)
     UNIQUE (bot_appid, kind, openid)
 );
 CREATE INDEX IF NOT EXISTS idx_idmap_openid ON id_map (openid);
@@ -36,6 +41,7 @@ CREATE TABLE IF NOT EXISTS group_members (
     nickname     TEXT NOT NULL DEFAULT '',
     role         TEXT NOT NULL DEFAULT 'member',
     last_seen    INTEGER NOT NULL,
+    card         TEXT NOT NULL DEFAULT '',     -- 群名片(author.member_nickname)
     PRIMARY KEY (bot_appid, group_openid, user_openid)
 );
 -- 按 last_seen 清理早已退群的成员(这张表原本只减不增靠成员退群事件)
@@ -62,7 +68,8 @@ CREATE TABLE IF NOT EXISTS messages (
     recalled_at    INTEGER NOT NULL DEFAULT 0,  -- 撤回时间(0=未撤回)
     sent_text      TEXT NOT NULL DEFAULT ''     -- 外发实际发出的文字(插件改写后与 content 不同)
 );
-CREATE INDEX IF NOT EXISTS idx_msg_qqid ON messages (bot_appid, qq_msg_id);
+-- 按 qq_msg_id 的查找(去重 / 作废被动凭据)都只找近期入站消息, 走 idx_msg_ts 限定时间窗;
+-- 原来的 (bot_appid, qq_msg_id) 索引键是随机串, 每条消息都改一个随机页, 已删(见 DROPPED_INDEXES)
 CREATE INDEX IF NOT EXISTS idx_msg_peer ON messages (bot_appid, chat_type, peer_openid, ts);
 CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages (ts);
 -- 引用回复入站要按 msg_idx 反查(每条带引用的消息一次), 没索引就是全扫该 bot
@@ -235,14 +242,29 @@ MIGRATIONS = [
      "passthrough_webhooks TEXT NOT NULL DEFAULT '[]'"),
     # 引用按内容找回时比对: 转发转网页等改写后, content 记的是原消息
     ("messages", "sent_text", "sent_text TEXT NOT NULL DEFAULT ''"),
+    # 2026-11-13 起群消息 author 带 member_nickname(群名片) 与 avatar(头像链接)
+    ("group_members", "card", "card TEXT NOT NULL DEFAULT ''"),
+    ("id_map", "avatar", "avatar TEXT NOT NULL DEFAULT ''"),
 ]
+
+# 老库里已不再需要的索引, 启动时删掉
+DROPPED_INDEXES = ("idx_msg_qqid",)
 
 
 class Database:
+    # 写入攒批: execute/executemany 不再每条语句单独提交, 最多等 COMMIT_DELAY 秒或攒满
+    # COMMIT_MAX 条再一起提交, 消息表和它的几个索引的尾页一次写完. 同一连接上的读看得到
+    # 未提交的写; 正常关闭会先提交, 进程被强杀最多丢这段时间的写入. COMMIT_DELAY<=0 即逐条提交.
+    # 消息约 1 条/秒时 1 秒窗口一批只有 2 条左右, 3 秒能让热页(消息表尾页/时间索引/活跃会话)多合并几次
+    COMMIT_DELAY = 3.0
+    COMMIT_MAX = 500
+
     def __init__(self, path: str):
         self.path = path
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        self._pending = 0
+        self._commit_task: asyncio.Task | None = None
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -255,9 +277,14 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
+        # 默认 1000 页就 checkpoint; 放到约 16MB, 两次 checkpoint 之间反复改的页只回写一次
+        await self._conn.execute("PRAGMA wal_autocheckpoint=4000")
+        await self._conn.execute("PRAGMA journal_size_limit=67108864")
         await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.executescript(SCHEMA)
         await self._migrate()
+        for name in DROPPED_INDEXES:
+            await self._conn.execute(f"DROP INDEX IF EXISTS {name}")
         await self._conn.commit()
 
     async def _migrate(self) -> None:
@@ -270,20 +297,57 @@ class Database:
                 await self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
     async def close(self) -> None:
+        task, self._commit_task = self._commit_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         if self._conn is not None:
+            async with self._lock:
+                await self._commit_locked()
             await self._conn.close()
             self._conn = None
 
     async def execute(self, sql: str, args: Iterable[Any] = ()) -> aiosqlite.Cursor:
         async with self._lock:
             cur = await self.conn.execute(sql, tuple(args))
-            await self.conn.commit()
+            await self._wrote_locked()
             return cur
 
     async def executemany(self, sql: str, rows: Iterable[Iterable[Any]]) -> None:
         async with self._lock:
             await self.conn.executemany(sql, [tuple(r) for r in rows])
+            await self._wrote_locked()
+
+    async def flush(self) -> None:
+        """立即提交攒着的写入."""
+        async with self._lock:
+            await self._commit_locked()
+
+    async def _wrote_locked(self) -> None:
+        self._pending += 1
+        if self.COMMIT_DELAY <= 0 or self._pending >= self.COMMIT_MAX:
+            await self._commit_locked()
+        elif self._commit_task is None:
+            self._commit_task = asyncio.create_task(self._delayed_commit())
+
+    async def _commit_locked(self) -> None:
+        if self._pending:
+            self._pending = 0
             await self.conn.commit()
+
+    async def _delayed_commit(self) -> None:
+        try:
+            await asyncio.sleep(self.COMMIT_DELAY)
+            async with self._lock:
+                self._commit_task = None
+                await self._commit_locked()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 提交失败时写入仍留在事务里, 下一次写入会重新安排提交
+            self._commit_task = None
+            logger.exception("deferred commit failed")
 
     async def fetchone(self, sql: str, args: Iterable[Any] = ()) -> aiosqlite.Row | None:
         cur = await self.conn.execute(sql, tuple(args))
@@ -302,6 +366,7 @@ class Database:
         import sqlite3  # noqa: PLC0415
         async with self._lock:
             try:
+                await self._commit_locked()     # VACUUM 不能在事务里跑
                 await self.conn.execute("VACUUM")
                 await self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except sqlite3.OperationalError as exc:

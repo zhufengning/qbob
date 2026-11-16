@@ -23,26 +23,44 @@ C2C_PASSIVE_WINDOW = 3600        # 60 min
 C2C_PASSIVE_BUDGET = 4
 MID_MIN, MID_MAX = 10**8, 2**31 - 10**6  # int32 内, 起始随机
 MID_BLOCK = 200   # 每次预留多少个 id(减少写库次数)
+# 按 qq_msg_id 找入站消息时的时间窗(走 idx_msg_ts): 重推 / @ 副本带的是同一个平台时间戳,
+# 只在事件缺 timestamp、ts 取了本地时钟时才会有偏差
+SEEN_TS_SLACK = 120
 
 
 MAX_FIELD_CHARS = 512   # 单字段截断长度(base64 图片可达几 MB)
+MAX_TEXT_CHARS = 16384  # 文字类字段另算: 截成开头 32 字, get_msg / 引用回查 / 管理台就只剩开头
+# (段类型, 字段): 正文性质的字段, 不会是 base64
+_TEXT_FIELDS = frozenset({("text", "text"), ("json", "data"), ("xml", "data"),
+                          ("markdown", "content")})
 MAX_NESTED_ITEMS = 50   # 嵌套 list 保留项数
 MAX_TOTAL_CHARS = 32768  # 单条消息落库总上限
 
 
-def _shrink(value, depth: int = 0):
+def _shrink(value, depth: int = 0, limit: int = MAX_FIELD_CHARS):
     """递归截断长字符串; 须下钻 list/dict, node 段的 data.content 里也有 base64 图."""
     if isinstance(value, str):
-        if len(value) > MAX_FIELD_CHARS:
-            return f"{value[:32]}…<省略 {len(value) - 32} 字符>"
+        if len(value) > limit:
+            keep = 32 if limit == MAX_FIELD_CHARS else limit
+            return f"{value[:keep]}…<省略 {len(value) - keep} 字符>"
         return value
     if depth >= 4:                      # 防御畸形/自引用结构
         return "…"
     if isinstance(value, list):
         return [_shrink(v, depth + 1) for v in value[:MAX_NESTED_ITEMS]]
     if isinstance(value, dict):
+        if isinstance(value.get("type"), str) and isinstance(value.get("data"), dict):
+            # 嵌套的消息段(node 的 content): 同样按段类型放宽文字字段
+            return {**{k: _shrink(v, depth + 1) for k, v in value.items() if k != "data"},
+                    "data": _shrink_data(value["type"], value["data"], depth + 1)}
         return {k: _shrink(v, depth + 1) for k, v in value.items()}
     return value
+
+
+def _shrink_data(seg_type: str, data: dict, depth: int = 0) -> dict:
+    return {k: _shrink(v, depth, MAX_TEXT_CHARS if (seg_type, k) in _TEXT_FIELDS
+                       else MAX_FIELD_CHARS)
+            for k, v in data.items()}
 
 
 def sanitize_segments(segments) -> list[dict]:
@@ -50,8 +68,9 @@ def sanitize_segments(segments) -> list[dict]:
     媒体段缺 file_id 的补上: get_msg / 引用回查读的就是库里这份."""
     out: list[dict] = []
     for seg in with_file_ids([seg for seg in segments or [] if isinstance(seg, dict)]):
-        data = {k: _shrink(v) for k, v in (seg.get("data") or {}).items()}
-        out.append({"type": seg.get("type", "text"), "data": data})
+        seg_type = seg.get("type", "text")
+        out.append({"type": seg_type,
+                    "data": _shrink_data(str(seg_type), seg.get("data") or {})})
     # 兜底: 段数极多时总量仍可能超限
     encoded = json.dumps(out, ensure_ascii=False)
     if len(encoded) > MAX_TOTAL_CHARS:
@@ -167,10 +186,13 @@ class MessageStore:
             "UPDATE messages SET content=? WHERE mid=?",
             (json.dumps(sanitize_segments(segments), ensure_ascii=False), mid))
 
-    async def seen(self, bot_appid: str, qq_msg_id: str) -> bool:
+    async def seen(self, bot_appid: str, qq_msg_id: str, ts: int) -> bool:
+        """这条入站消息是否已落库. ts 为事件时间戳(与入库时同一口径)."""
         row = await self.db.fetchone(
-            "SELECT mid FROM messages WHERE bot_appid=? AND qq_msg_id=? AND direction='in'",
-            (bot_appid, qq_msg_id),
+            "SELECT mid FROM messages INDEXED BY idx_msg_ts"
+            " WHERE ts BETWEEN ? AND ? AND bot_appid=? AND qq_msg_id=? AND direction='in'"
+            " LIMIT 1",
+            (ts - SEEN_TS_SLACK, ts + SEEN_TS_SLACK, bot_appid, qq_msg_id),
         )
         return row is not None
 
@@ -228,11 +250,17 @@ class MessageStore:
     async def revoke_reply_slot(self, bot_appid: str, slot: tuple) -> None:
         """平台拒了这个被动凭据(过期/无效/该事件不能回复): 作废, 之后不再选它."""
         credential, _, kind = slot
-        sql = ("UPDATE passive_events SET expire=0 WHERE bot_appid=? AND event_id=?"
-               if kind == "event" else
-               "UPDATE messages SET passive_expire=0 WHERE bot_appid=? AND qq_msg_id=?")
+        if kind == "event":
+            sql = "UPDATE passive_events SET expire=0 WHERE bot_appid=? AND event_id=?"
+            args: tuple = (bot_appid, credential)
+        else:
+            # 凭据只会取自窗口内的入站消息(passive_expire = ts + 窗口), 按时间窗定位
+            sql = ("UPDATE messages INDEXED BY idx_msg_ts SET passive_expire=0"
+                   " WHERE ts >= ? AND bot_appid=? AND qq_msg_id=? AND direction='in'")
+            since = int(time.time()) - max(GROUP_PASSIVE_WINDOW, C2C_PASSIVE_WINDOW) - SEEN_TS_SLACK
+            args = (since, bot_appid, credential)
         async with self._lock:
-            await self.db.execute(sql, (bot_appid, credential))
+            await self.db.execute(sql, args)
 
     async def acquire_reply_slot(
         self,
