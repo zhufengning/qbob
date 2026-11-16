@@ -34,6 +34,7 @@ from ..db import Database
 from ..idmap import IdMap
 from ..qq.api import QQApiClient, QQApiError
 from ..onebot import events as ob_events
+from ..onebot.faces import SYSFACE_NAMES
 from ..plugin import HookContext, registry as plugins
 from .access import AccessControl
 from .builtin import BuiltinCommands, match_builtin
@@ -156,6 +157,13 @@ _FWD_ATTACH_RE = re.compile(
     r"(?:[ \t]+大小:(\S+))?(?:[ \t]+URL:(\S+))?[ \t]*$", re.M)
 # 渲染文本没有平台嵌套 id, 用根消息 id 与节点路径生成稳定的本地 id
 FORWARD_NEST_MAX_DEPTH = 8
+
+
+def _is_rendered_forward(data: dict, text: str) -> bool:
+    """content 整段是平台渲染的合并转发文本(由 forward 段代替)."""
+    return (data.get("message_type") in (101, 102)
+            and bool(_FWD_BLOCK_RE.search(text)))
+
 
 _LINK_KEYS = ("jumpurl", "jump_url", "qqdocurl", "url", "link", "share_url",
               "detail_url", "web_url", "weburl")
@@ -920,7 +928,7 @@ class BotInstance:
 
     @staticmethod
     def _split_faces(segments: list[dict]) -> list[dict]:
-        """把文本里的 <faceType=..,faceId=".."> 切成 OneBot face 段; ext 文字存为 summary."""
+        """把文本里的 <faceType=..,faceId=".."> 切成 OneBot face 段; raw 按 NapCat 形状填, ext 文字存为 summary."""
         out: list[dict] = []
         for seg in segments:
             if seg.get("type") != "text":
@@ -935,7 +943,7 @@ class BotInstance:
                 if match.group(1) == "6":
                     pos = match.end()
                     continue
-                data = {"id": match.group(2)}   # OneBot face 段只认 id
+                data = {"id": match.group(2)}
                 raw_ext = match.group(3) or ""
                 if raw_ext:
                     try:
@@ -947,6 +955,14 @@ class BotInstance:
                     except Exception:
                         pass
                 if data["id"]:
+                    # NapCat 的 raw 是原始 face 元素, 名字在 raw.faceText(带前导 /)
+                    raw = {"faceIndex": int(data["id"])}
+                    name = SYSFACE_NAMES.get(data["id"])
+                    if name:
+                        raw["faceText"] = f"/{name}"
+                    elif data.get("summary"):
+                        raw["faceText"] = data["summary"]
+                    data["raw"] = raw
                     out.append({"type": "face", "data": data})
                 elif data.get("summary"):
                     out.append({"type": "text", "data": {"text": data["summary"]}})
@@ -1128,7 +1144,8 @@ class BotInstance:
                         segments.append({"type": "text", "data": {"text": fallback}})
 
             if not segments:
-                continue
+                # 平台可能只给发送者不给内容(嵌套转发没展开): 保留占位, 别丢掉这条
+                segments.append({"type": "text", "data": {"text": "[聊天记录]"}})
             nodes.append({
                 "sender": {"user_id": 0,
                            "nickname": sender.group(1).strip() if sender else "未知"},
@@ -1487,10 +1504,13 @@ class BotInstance:
         ts = _parse_ts(data.get("timestamp"))
 
         text = (data.get("content") or "").strip()
+        # 渲染形式的合并转发整段由 forward 段表示, 不再拆成文字/表情片段
+        # (拆出来的表情与首尾文字会重复出现在正文里)
+        rendered_forward = _is_rendered_forward(data, text)
         # 认 "@bot 自己" 要用群状态里的 member_openid(首见该群才查接口)
         state = await self.group_state(group_openid, reason="first-seen")
         content_segs, at_in_text = await self._content_segments(
-            text, state.bot_openid)
+            "" if rendered_forward else text, state.bot_openid)
         command_text = "".join(
             seg["data"].get("text", "") for seg in content_segs
             if seg["type"] == "text").strip()
@@ -1621,7 +1641,7 @@ class BotInstance:
         reply = await self._reply_segment(data, "private", user_openid, user_virtual)
         if reply is not None:
             segments.append(reply)
-        if text:
+        if text and not _is_rendered_forward(data, text):
             segments.append({"type": "text", "data": {"text": text}})
         segments.extend(await self._attachments_to_segments(data))
         extra = await self._extra_segments(data, qq_msg_id)
