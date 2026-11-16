@@ -181,6 +181,55 @@ def _ark_link(ark: dict) -> str:
 
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
 
+# 引用归属时参与比较的媒体段类型
+_MATCH_MEDIA_TYPES = frozenset({"image", "record", "video", "file"})
+
+
+def _media_name_of(seg: dict) -> str:
+    """媒体段的平台文件名; 地址里的 rkey 每次引用都重新签发, 不能当匹配特征."""
+    data = seg.get("data") or {}
+    name = str(data.get("name") or data.get("file") or "").strip()
+    if "://" in name or name.startswith(("base64:", "data:")):
+        return ""
+    return name
+
+
+def _stable_signature(
+    segments: list,
+) -> tuple[str, list[str], list[tuple[str, str]], set[int]]:
+    """消息段 -> 引用归属用的特征, 只保留重新签发地址与改写文字都改不掉的字段.
+
+    文字取 text 段原文拼成的整段, 表情取 face 段的编号, 媒体取段类型与平台文件名,
+    媒体字节数另作兜底. face 的 summary/raw 由本进程按编号生成, 媒体的
+    URL/file_id 带会过期的 rkey, 都不参与比较.
+    """
+    texts: list[str] = []
+    faces: list[str] = []
+    media: list[tuple[str, str]] = []
+    sizes: set[int] = set()
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        kind = str(seg.get("type") or "")
+        data = seg.get("data") or {}
+        if kind == "text":
+            texts.append(str(data.get("text") or ""))
+        elif kind == "face":
+            face_id = str(data.get("id") or "").strip()
+            if face_id:
+                faces.append(face_id)
+        elif kind in _MATCH_MEDIA_TYPES:
+            media.append((kind, _media_name_of(seg)))
+            for key in ("size", "file_size"):
+                try:
+                    size = int(data.get(key) or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                if size:
+                    sizes.add(size)
+                    break
+    return "".join(texts).strip(), faces, media, sizes
+
 
 def _find_link(node, depth: int = 0) -> str:
     """在 ARK 结构里找跳转链接(键名不固定, 递归找一层层嵌套的 fields)."""
@@ -1274,19 +1323,24 @@ class BotInstance:
     ) -> tuple[int | None, bool]:
         """引用 idx 对不上时, 按内容特征在近 30 分钟的同会话消息里归属.
 
-        媒体按字节大小与外发的 media_sizes 求交, 文本要精确相等(也比插件改写后
-        实际发出的文字). 外发优先, 再退到入站; 取最近一条.
+        引用内容与库内记录用同一套规则提取特征: 文字整段相等(含 markdown 与卡片在
+        引用里的渲染写法), 表情编号一致, 媒体类型与平台文件名一致, 外发的媒体再用
+        字节数兜底(库里只留了大小). 全部特征都与候选吻合才算命中. 外发优先, 再退到
+        入站; 命中多条时选取最近一条, 并标明候选不唯一.
         返回 (mid, 是否唯一候选), 都不中为 (None, False).
         """
-        text = str(element.get("content") or "").strip()
-        sizes = set()
+        segments = await self._element_segments(element)
+        quoted_text, quoted_faces, quoted_media, quoted_sizes = _stable_signature(segments)
         for att in element.get("attachments") or []:
-            if isinstance(att, dict) and att.get("size"):
-                try:
-                    sizes.add(int(att["size"]))
-                except (TypeError, ValueError):
-                    pass
-        if not text and not sizes:
+            if not isinstance(att, dict):
+                continue
+            try:
+                size = int(att.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size:
+                quoted_sizes.add(size)
+        if not (quoted_text or quoted_faces or quoted_media or quoted_sizes):
             return None, False
         rows = await self.db.fetchall(
             "SELECT mid, direction, content, media_sizes, sent_text FROM messages"
@@ -1298,32 +1352,37 @@ class BotInstance:
         )
         # 引用 markdown 消息时平台可能给原文: 链接写回纯文本发送时的「文字 网址」;
         # 引用图文卡片给的是渲染文本, 还原成发送时记的 标题+简介
-        texts = {text, _MD_LINK_RE.sub(r"\1 \2", text), cards.key_from_quote(text)} - {""}
+        texts = {quoted_text, _MD_LINK_RE.sub(r"\1 \2", quoted_text),
+                 cards.key_from_quote(quoted_text)} - {""}
         hits: dict[str, list[int]] = {"out": [], "in": []}
         for row in rows:
             if out_only and row["direction"] != "out":
                 continue
-            hit = False
-            if sizes:
-                # 外链媒体没记字节大小, 字节不中还要试文本, 不能一票否决
-                try:
-                    row_sizes = set(json.loads(row["media_sizes"] or "[]"))
-                except ValueError:
-                    row_sizes = set()
-                hit = bool(sizes & row_sizes)
-            if not hit and texts:
-                try:
-                    segs = json.loads(row["content"])
-                except ValueError:
-                    segs = []
-                row_text = "".join(
-                    s.get("data", {}).get("text", "")
-                    for s in segs if isinstance(s, dict) and s.get("type") == "text"
-                ).strip()
-                # 插件改写过的(转发转网页等), 记录的是原消息, 要比实际发出的文字
-                hit = bool(texts & ({row_text, str(row["sent_text"] or "").strip()} - {""}))
-            if hit:
-                hits["out" if row["direction"] == "out" else "in"].append(row["mid"])
+            try:
+                segs = json.loads(row["content"])
+            except ValueError:
+                segs = []
+            row_text, row_faces, row_media, row_sizes = _stable_signature(
+                segs if isinstance(segs, list) else [])
+            try:
+                row_sizes.update(int(size) for size in json.loads(row["media_sizes"] or "[]"))
+            except (TypeError, ValueError):
+                pass
+            # 插件改写过的(转发转网页等), 记录的是原消息, 要比实际发出的文字
+            row_texts = {row_text, str(row["sent_text"] or "").strip()} - {""}
+            if quoted_faces != row_faces:
+                continue
+            if quoted_text:
+                if not (texts & row_texts):
+                    continue
+            elif row_text:
+                continue
+            if quoted_media:
+                named = all(name for _kind, name in quoted_media)
+                if not ((named and quoted_media == row_media)
+                        or (quoted_sizes & row_sizes)):
+                    continue
+            hits["out" if row["direction"] == "out" else "in"].append(row["mid"])
         picked = hits["out"] or hits["in"]
         return (picked[0], len(picked) == 1) if picked else (None, False)
 
